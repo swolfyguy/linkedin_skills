@@ -2,8 +2,8 @@ from linkedin_scraper import actions
 from selenium import webdriver
 import time
 
-email ="sk4196485@gmail.com"
-password="P@ssword9802"
+email = "XXXXXXXX"
+password= "XXXXXX"
 
 class Linkedin:
 
@@ -32,7 +32,7 @@ class Linkedin:
         total_skills = len(
             self.driver.find_elements_by_xpath("//ol[starts-with(@class,'pv-skill-categories-section')]/li"))
         for skill in range(1, total_skills + 1):
-            skill_prefix_xpath = f"//ol[starts-with(@class,'pv-skill-categories-section')]/li[{skill}]/div/div[2]/p"
+            skill_prefix_xpath = f"//ol[starts-with(@class,'pv-skill-categories-section')]/li[{skill}]/div//p"
             try:
                 skill = self.driver.find_element_by_xpath(f"{skill_prefix_xpath}/span").text
                 print(f"Skill: {skill}")
