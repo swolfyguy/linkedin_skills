@@ -1,15 +1,17 @@
 from linkedin_scraper import actions
 from selenium import webdriver
 import time
+import Levenshtein as lev
 
-email = "XXXXXXXX"
-password= "XXXXXX"
+email = "****"
+password = "***"
+
 
 class Linkedin:
 
     def __init__(self):
         options = webdriver.ChromeOptions()
-        # options.add_argument("--headless")
+        options.add_argument("--headless")
         options.add_argument("--start-maximized")
         self.driver = webdriver.Chrome("./chromedriver", chrome_options=options)
         actions.login(self.driver, email, password)
@@ -17,16 +19,16 @@ class Linkedin:
         self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         print("Scrolled to Bottom")
 
-    def skills(self):
+    def skills(self, employee_skills: list):
         max_wait = 1
-        while max_wait <= 10:
+        while max_wait <= 100:
             try:
                 self.driver.find_element_by_xpath('//h2[text()="Skills & Endorsements"]')
                 print("Skills and Endorsements attached to Dom")
                 break
             except Exception as e:
                 time.sleep(1)
-                max_wait +=1
+                max_wait += 1
 
         skills_lst = []
         total_skills = len(
@@ -40,8 +42,20 @@ class Linkedin:
                 skill = self.driver.find_element_by_xpath(f"{skill_prefix_xpath}/a/span").text
                 print(f"Skill: {skill}")
             skills_lst.append(skill)
-        return skills_lst
 
+        # skills_lst = ['Java', 'Python', 'Selenium WebDriver']
+        score_list = []
+        if employee_skills:
+            for employee_skill in employee_skills:
+                for linkedin_skill in skills_lst:
+                    if employee_skill.lower() in linkedin_skill.lower().split():
+                        print(linkedin_skill)
+                        score = lev.ratio(employee_skill.lower(), linkedin_skill.lower()) * 100
+                        score_list.append(score)
 
-print(Linkedin().skills())
+            return sum(score_list) / len(employee_skills)
+        else:
+            return 0
 
+# employee_skills = ['java', 'python', "sql"]
+# Linkedin().skills(employee_skills)
