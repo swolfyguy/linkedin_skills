@@ -1,284 +1,388 @@
 import logging
-import os
+import re
 import time
-from unicodedata import category
-
+import psycopg2
+import requests
+import json
 from selenium import webdriver
-from selenium.webdriver import Keys
 from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.common.by import By
-from selenium.webdriver.remote.webelement import WebElement
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, NoSuchElementException, StaleElementReferenceException
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-class CATEGORY:
-    PEOPLE = "People"
-
-
-class initializer:
-    def __init__(self, username, password, query, personalized_note=None):
-        # chrome_options = webdriver.ChromeOptions()
-        # chrome_options.binary_location = os.environ.get("GOOGLE_CHROME_BIN")
-        # chrome_options.add_argument("--headless")
-        # chrome_options.add_argument("--disable-dev-shm-usage")
-        # chrome_options.add_argument("--no-sandbox")
-        self.driver = webdriver.Chrome()
-        # self.driver = webdriver.Chrome("src/resources/chromedriver")
-        self.driver.maximize_window()
+class LinkedInPostScraper:
+    def __init__(self, username, password, search_query, db_params):
+        options = webdriver.ChromeOptions()
+        options.add_argument("--start-maximized")
+        options.add_argument("--disable-notifications")
+        self.driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
         self.username = username
         self.password = password
-        self.query = query
-        f"""
-        I noticed that you are a recruiter. I’m a Software Engineer with 7+ years Experience and currently seeking new opportunities. 
-        I’d love to find out if I may be a fit for any of your current openings, 
-        and I’d also be happy to conn1ect you with other professionals in my field
-        """
-        if not personalized_note:
-            self.personalized_note = f"""
-I noticed that you are a recruiter. I’m a Software Engineer with 8+ years Experience. 
-I’d love to connect with you for future opportunities and I am more than happy to help you connect with my network and I am sure that it will be beneficial for both of us
-"""
-        else:
-            self.personalized_note = personalized_note
+        self.search_query = search_query
+        self.db_params = db_params
+        self.conn = None
+        self.cursor = None
 
-    def open_linkedin(self):
-        self.driver.get("https://www.linkedin.com/")
+    def reset_table(self):
+        try:
+            self.cursor.execute("TRUNCATE TABLE posts;")
+            self.cursor.execute("ALTER SEQUENCE posts_id_seq RESTART WITH 1;")
+            self.conn.commit()
+            print("Table 'posts' has been reset and ID sequence restarted.")
+        except (Exception, psycopg2.Error) as error:
+            print(f"Error resetting table: {error}")
+            self.conn.rollback()
 
-    def quit_browser(self):
-        self.driver.quit()
+    def setup_database(self):
+        try:
+            self.conn = psycopg2.connect(**self.db_params)
+            self.cursor = self.conn.cursor()
+            self.cursor.execute('''
+                CREATE TABLE IF NOT EXISTS posts (
+                    id SERIAL PRIMARY KEY,
+                    author TEXT,
+                    content TEXT,
+                    email TEXT,
+                    phone_number TEXT,
+                    UNIQUE (author, content)
+                )
+            ''')
+            self.conn.commit()
+            print("Database connection established and table created/verified.")
+        except (Exception, psycopg2.Error) as error:
+            print(f"Error while connecting to PostgreSQL: {error}")
+            if self.conn:
+                self.conn.close()
+            raise
+
+    def click_more_button(self):
+        try:
+            while True:
+                more_buttons = WebDriverWait(self.driver, 10).until(
+                    EC.presence_of_all_elements_located((By.XPATH, "//span[text()='…more']"))
+                )
+                if not more_buttons:
+                    logging.info("No '...more' buttons found. Moving on.")
+                    break
+                
+                for button in more_buttons:
+                    try:
+                        WebDriverWait(self.driver, 10).until(
+                            EC.element_to_be_clickable(button)
+                        )
+                        self.driver.execute_script("arguments[0].scrollIntoView(true);", button)
+                        self.driver.execute_script("arguments[0].click();", button)
+                        logging.info("Clicked '...more' button")
+                    except (StaleElementReferenceException, TimeoutException) as e:
+                        logging.warning(f"Could not click '...more' button: {e}")
+                        continue
+                
+                # Wait for any animations or page updates to complete
+                time.sleep(2)
+            
+        except TimeoutException:
+            logging.info("No more '...more' buttons found or timeout occurred. Moving on.")
+        except Exception as e:
+            logging.error(f"Error during clicking '...more' button: {e}")
+
+    def clean_author_name(self, author):
+        # Remove any "hashtag" from the author name
+        author = re.sub(r'^hashtag\s*', '', author)
+        if '\n' in author:
+            return author.split('\n')[0].strip()
+        return author.strip()
+
+    def clean_content(self, content):
+        # Remove redundant hashtags
+        content = re.sub(r'hashtag\s*#', '#', content)
+        # Remove consecutive newlines
+        content = re.sub(r'\n+', '\n', content)
+        return content.strip()
+
+    def extract_phone_number(self, content):
+        # This regex pattern covers various phone number formats
+        phone_pattern = r'\b(?:\+?(\d{1,3}))?[-. (]*(?:\d{3})[-. )]*\d{3}[-. ]*\d{4}\b'
+        match = re.search(phone_pattern, content)
+        return match.group(0) if match else None
+
+    def post_exists(self, author, content):
+        try:
+            self.cursor.execute(
+                "SELECT COUNT(*) FROM posts WHERE author = %s AND content = %s",
+                (author, content)
+            )
+            count = self.cursor.fetchone()[0]
+            return count > 0
+        except (Exception, psycopg2.Error) as error:
+            print(f"Error checking for existing post: {error}")
+            return False
+
+    def search_posts(self):
+        try:
+            search_bar = WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.CLASS_NAME, "search-global-typeahead__input"))
+            )
+            search_bar.send_keys(self.search_query)
+            search_bar.send_keys(Keys.RETURN)
+            time.sleep(5)
+
+            logging.info("Searching for content tab...")
+            filter_section = WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.ID, "search-reusables__filters-bar"))
+            )
+            logging.info("Filter section found.")
+
+            filter_options = filter_section.find_elements(By.XPATH, ".//button")
+
+            content_tab = None
+            for option in filter_options:
+                if 'Posts' in option.text:
+                    content_tab = option
+                    break
+
+            if content_tab:
+                logging.info("Content tab found. Clicking...")
+                content_tab.click()
+            else:
+                logging.info("Content tab not found. Proceeding with default view.")
+            
+            time.sleep(5)
+
+            logging.info(f"Current URL: {self.driver.current_url}")
+
+        except (TimeoutException, NoSuchElementException) as e:
+            logging.error(f"Search failed: {str(e)}")
+            self.driver.save_screenshot("search_error.png")
+            logging.info("Error screenshot saved as search_error.png")
+            self.driver.quit()
+            raise
 
     def login(self):
-        self.click_element(self.get_element(by=By.LINK_TEXT, value="Sign in"))
-        self.enter_text(
-            self.get_element(by=By.ID, value="username"), value=self.username
-        )
-        self.enter_text(
-            self.get_element(by=By.ID, value="password"), value=self.password
-        )
-        self.get_element(by=By.XPATH, value="//button[@type='submit']").submit()
-
-    def search_query(self):
-        time.sleep(2)
-        search_ele = self.get_element(
-            by=By.XPATH,
-            value="//input[@placeholder='Search for jobs, skills, companies...']",
-        )
-        if not search_ele:
-            # Sometime instead of 'Search for jobs, skills, companies...' its only 'Search'
-            search_ele = self.get_element(
-                by=By.XPATH, value="//input[@placeholder='Search']"
+        self.driver.get("https://www.linkedin.com/login")
+        try:
+            username_field = WebDriverWait(self.driver, 20).until(
+                EC.presence_of_element_located((By.ID, "username"))
             )
+            password_field = self.driver.find_element(By.ID, "password")
+            
+            username_field.send_keys(self.username)
+            password_field.send_keys(self.password)
+            password_field.send_keys(Keys.RETURN)
 
-        search_ele.click()
-        search_ele.send_keys(self.query)
-        search_ele.send_keys(Keys.ENTER)
+            WebDriverWait(self.driver, 20).until(
+                EC.presence_of_element_located((By.ID, "global-nav"))
+            )
+            logging.info("Login successful")
 
-    def click_query_category(self, category):
-        categories_ele = self.get_elements(by=By.XPATH, value="//div[@id='search-reusables__filters-bar']/ul")
-        for category_index in range(1, len(categories_ele) + 1):
-            category_ele = self.get_element(by=By.XPATH,
-                                            value=f"//div[@id='search-reusables__filters-bar']/ul/li[{category_index}]/button")
-            if category_ele.text == "People":
-                category_ele.click()
-                break
+        except (TimeoutException, NoSuchElementException) as e:
+            logging.error(f"Login failed: {str(e)}")
+            self.driver.quit()
+            raise
 
-        # category_ele = self.get_element(
-        #     by=By.XPATH, value="//div[@id='search-reusables__filters-bar']/ul/li[1]/button", time_=20
-        # )
-        # category_ele.click()
+    def scrape_posts(self, num_posts=10):
+        posts = []
+        scroll_attempts = 0
+        max_scroll_attempts = 5
 
-    def connect_people(self):
-        def refresh_connect_eles(connect_eles):
-            for _ in range(10):
+        author_elements = [
+            ".//span[contains(@class, 'feed-shared-actor__name')]",
+            ".//span[contains(@class, 'update-components-actor__name')]",
+            ".//span[contains(@class, 'visually-hidden')]",
+            ".//span[contains(@class, 'update-components-actor__title')]"
+        ]
+
+        content_elements = [
+            ".//div[contains(@class, 'feed-shared-update-v2__description')]",
+            ".//div[contains(@class, 'feed-shared-text')]",
+            ".//div[contains(@class, 'update-components-text')]",
+            ".//div[contains(@class, 'feed-shared-update-v2__content')]"
+        ]
+
+        while len(posts) < num_posts and scroll_attempts < max_scroll_attempts:
+            self.click_more_button()
+
+            post_elements = self.driver.find_elements(By.XPATH, "//div[contains(@class, 'feed-shared-update-v2') or contains(@class, 'occludable-update')]")
+            
+            for post in post_elements:
+                if len(posts) >= num_posts:
+                    break
+                
                 try:
-                    connect_eles[1].get_attribute("class");
-                    return connect_eles
-                except:
-                    connect_eles = self.get_elements(
-                        by=By.XPATH, value="//span[text()='Connect']", time_=20
-                    )
-                    time.sleep(1)
+                    author = None
+                    for element in author_elements:
+                        try:
+                            author = post.find_element(By.XPATH, element).text
+                            if author:
+                                author = self.clean_author_name(author)
+                                break
+                        except NoSuchElementException:
+                            continue
 
-        count = 1
-        while True:
-            time.sleep(5)
-            class_ = "entity-result__actions entity-result__divider"
-            connect_eles = self.get_elements(
-                by=By.XPATH, value="//span[text()='Connect']", time_=20
-            )
-            connect_parent_ele_xpath = f"div[@class='{class_}']/button"
-            # for index in range(1, 11):
-            #     follow_or_invite_str = self.get_element(
-            #         by=By.XPATH,
-            #         value=f"//ul[@class='reusable-search__entity-result-list list-style-none']/li[{index}]//{connect_parent_ele_xpath}/span",
-            #     ).text
-            if connect_eles:
-                loop = len(connect_eles)
-                for index in range(loop) or []:
-                    # close any opened messaging dialogue
-                    message_dialogues_ele = self.get_elements(by=By.XPATH, value="//aside[@id='msg-overlay']/div")
-                    if len(message_dialogues_ele) != 3:
-                        for _index in range(2, len(message_dialogues_ele) - 1):
-                            self.click_element(by=By.XPATH,
-                                               value=f"//aside[@id='msg-overlay']/div[{_index}]//li-icon[@type='close']")
-                            time.sleep(1)
+                    if not author:
+                        logging.warning("Could not find author name, skipping post")
+                        continue
 
-                    connect_ele = connect_eles[index]
-                    recruiter_name = connect_ele.find_element(by=By.XPATH, value="..").get_attribute(
-                        "aria-label"
-                    )[7:][:-11]
+                    content = None
+                    for element in content_elements:
+                        try:
+                            content = post.find_element(By.XPATH, element).text
+                            if content:
+                                content = self.clean_content(content)
+                                break
+                        except NoSuchElementException:
+                            continue
 
-                    print("recruiter name: ", recruiter_name)
+                    if not content:
+                        logging.warning("Could not find post content, skipping post")
+                        continue
 
-                    recruiter_personalized_note = (
-                        f"Hi {recruiter_name}, {self.personalized_note}"
-                    )
+                    # Check if post already exists in the database
+                    if self.post_exists(author, content):
+                        logging.info(f"Post by {author} already exists. Skipping.")
+                        continue
 
-                    # connect_ele = refresh_connect_eles(connect_eles)[index]
-                    # Click Connect
-                    time.sleep(2)
-                    connect_ele.click()
-                    time.sleep(2)
-                    # self.click_element(
-                    #     self.get_element(
-                    #         by=By.XPATH, value=f"{connect_parent_ele_xpath}/span"
-                    #     )
-                    # )
-                    # Click Add a Note
+                    email = None
+                    email_match = re.search(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', content)
+                    if email_match:
+                        email = email_match.group(0)
 
-                    send_connect_header_ele = self.get_element(by=By.XPATH, value="//h2[@id='send-invite-modal']")
-                    if "How do you know" in send_connect_header_ele.text:
-                        self.click_element(by=By.XPATH, value="//button[@aria-label='Other']")
-                        time.sleep(1)
-                        self.click_element(by=By.XPATH, value="//button[@aria-label='Connect']")
-                        time.sleep(1)
+                    phone_number = self.extract_phone_number(content)
+                    
+                    # Insert the post into the PostgreSQL database
+                    try:
+                        self.cursor.execute(
+                            "INSERT INTO posts (author, content, email, phone_number) VALUES (%s, %s, %s, %s)",
+                            (author, content, email, phone_number)
+                        )
+                        self.conn.commit()
+                        logging.info(f"Successfully scraped and stored new post by {author}")
+                        posts.append({
+                            "author": author,
+                            "content": content,
+                            "email": email,
+                            "phone_number": phone_number
+                        })
+                    except psycopg2.IntegrityError:
+                        self.conn.rollback()
+                        logging.warning(f"Duplicate post detected for {author}. Skipping.")
+                    except (Exception, psycopg2.Error) as error:
+                        logging.error(f"Error inserting post into database: {error}")
+                        self.conn.rollback()
+                    
+                except Exception as e:
+                    logging.error(f"Error scraping post: {str(e)}")
+                    continue
 
-                    send_ele = self.get_element(
-                        by=By.XPATH, value="//span[text()='Send without a note']"
-                    )
-                    send_ele.click()
-                    # if send_ele.is_enabled():
-                    #
-                    #     self.click_element(
-                    #         by=By.XPATH, value="//button[@aria-label='Add a note']"
-                    #     )
-                    #     # Enter personalized Note
-                    #     self.enter_text(
-                    #         self.get_element(by=By.ID, value="custom-message"),
-                    #         value=recruiter_personalized_note,
-                    #     )
-                    #     # Click Send Now
-                    #     self.click_element(send_ele)
-                    #     print(f"sent connection to {recruiter_name}")
-                    #
-                    #     print("sleep", end=" ")
-                    #     _sleep = 1
-                    #     while _sleep < 10:
-                    #         try:
-                    #             self.driver.find_element(by=By.CLASS_NAME, value='artdeco-toast-item__content')
-                    #             self.get_elements(by=By.XPATH,
-                    #                               value="//div[@data-test-artdeco-toast-item-type='error']/button")[
-                    #                 0].click()
-                    #             time.sleep(1)
-                    #             break
-                    #         except:
-                    #             time.sleep(1)
-                    #             print(_sleep, end=" ")
-                    #             _sleep += 1
-                    #     else:
-                    #         print("total requests sent: ", count)
-                    #         count = count + 1
-                    #     print()
-                    # else:
-                    #     self.click_element(
-                    #         by=By.XPATH,
-                    #         value="//div[@role='dialog']/button[@aria-label='Dismiss']",
-                    #     )
-                    #     time.sleep(1)
-
-            self.driver.execute_script(
-                "window.scrollTo(0, document.body.scrollHeight);"
-            )
+            # Scroll down to load more posts
+            last_height = self.driver.execute_script("return document.body.scrollHeight")
+            self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
             time.sleep(2)
-            next_page_ele = self.get_element(by=By.XPATH, value="//span[text()='Next']")
-            self.driver.execute_script("arguments[0].scrollIntoView();", next_page_ele)
-            # click next page
-            self.click_element(next_page_ele)
+            new_height = self.driver.execute_script("return document.body.scrollHeight")
+            if new_height == last_height:
+                scroll_attempts += 1
+            else:
+                scroll_attempts = 0
 
-    def get_element(self, by: By, value: str, time_: int = 10):
-        counter = 1
-        while counter < time_:
-            try:
-                return self.driver.find_element(by=by, value=value)
-            except Exception as e:
-                time.sleep(1)
-                counter += 1
+        return posts
 
-    def get_elements(self, by: By, value: str, time_: int = 10):
-        for _ in range(1, time_):
-            if eles := self.driver.find_elements(by=by, value=value):
-                return eles
-            time.sleep(1)
+    def run(self):
+        try:
+            self.setup_database()
+            self.reset_table()
+            self.login()
+            self.search_posts()
+            posts = self.scrape_posts()
+            return posts
+        except Exception as e:
+            logging.error(f"An error occurred during scraping: {str(e)}")
+            return []
+        finally:
+            if self.driver:
+                self.driver.quit()
 
-    def click_element(
-            self,
-            element: WebElement = None,
-            by: By = None,
-            value: str = None,
-            time_: int = 10,
-    ):
-        counter = 1
-        while counter < time_:
-            try:
-                if element:
-                    element.click()
-                else:
-                    self.get_element(by=by, value=value).click()
-                break
-            except Exception as e:
-                time.sleep(1)
-                counter += 1
+    def close_connection(self):
+        if self.conn:
+            self.cursor.close()
+            self.conn.close()
+            logging.info("Database connection closed.")
 
-    @staticmethod
-    def enter_text(element: WebElement, value: str, time_: int = 10):
-        counter = 1
-        while counter < time_:
-            try:
-                element.send_keys(value)
-                break
-            except Exception as e:
-                time.sleep(1)
-                counter += 1
+    def get_post_by_id(self, post_id):
+        try:
+            self.cursor.execute("SELECT * FROM posts WHERE id = %s", (post_id,))
+            post = self.cursor.fetchone()
+            if post:
+                return {
+                    "id": post[0],
+                    "author": post[1],
+                    "content": post[2],
+                    "email": post[3],
+                    "phone_number": post[4]
+                }
+            else:
+                return None
+        except (Exception, psycopg2.Error) as error:
+            logging.error(f"Error retrieving post from database: {error}")
+            return None
 
+def query_llama(prompt, post_content):
+    url = "http://localhost:11434/api/generate"
+    
+    data = {
+        "model": "llama3.1",
+        "prompt": f"Based on the following LinkedIn post, {prompt}\n\nPost content: {post_content}",
+        "stream": False
+    }
+    
+    response = requests.post(url, json=data)
+    
+    if response.status_code == 200:
+        result = json.loads(response.text)
+        return result['response']
+    else:
+        return f"Error: Unable to get a response from the Llama model. Status code: {response.status_code}"
 
-def main(i, param0, param1):
-    try:
+def main():
+    username = "your_email@example.com"
+    password = "your_password"
+    search_query = "python developer"
+    
+    db_params = {
+        "database": "linkedin",
+        "user": "postgres",
+        "password": "postgres",
+        "host": "localhost",
+        "port": "5432"
+    }
 
-        if i == 0:
-            args = param0
+    scraper = LinkedInPostScraper(username, password, search_query, db_params)
+    posts = scraper.run()
+
+    print(f"Scraped {len(posts)} posts and stored them in the PostgreSQL database.")
+    print("Press Enter to continue to querying...")
+    input()  # Wait for user to press Enter
+
+    # Query specific posts using Llama
+    while True:
+        post_id = input("Enter the ID of the post you want to query (or 'q' to quit): ")
+        if post_id.lower() == 'q':
+            break
+
+        post = scraper.get_post_by_id(post_id)
+        if post:
+            print(f"Post content: {post['content']}")
+            user_query = input("Enter your query about this post: ")
+            
+            llama_response = query_llama(user_query, post['content'])
+            print(f"Llama's response: {llama_response}")
         else:
-            args = param1
-        driver = initializer(**args)
-        driver.open_linkedin()
-        driver.login()
-        driver.search_query()
-        driver.click_query_category(category=CATEGORY.PEOPLE)
-        driver.connect_people()
-        driver.quit_browser()
-    except Exception as e:
-        # main(i, param0, param1)
-        logging.info(e)
-        raise e
+            print(f"No post found with ID {post_id}")
+
+    scraper.close_connection()
 
 if __name__ == "__main__":
-    print("running on heroku....")
-    param0 = {
-        "username": "email_is",
-        "password": "password",
-        "query": "hiring python developer",
-        "personalized_note": f"""
-        """
-    }
-    param1 = {
-    }
-
-    main(0, param0, param1)
+    main()
